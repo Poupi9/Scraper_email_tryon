@@ -1,0 +1,558 @@
+# file: contact_scraper.py
+"""
+Scraper 'contact-only' pour boutiques (Paris ou autre).
+Visite uniquement Contact/FAQ/Legal et leurs enfants pertinents (profondeur limitée),
+extrait des emails valides et écrit un CSV épuré (lignes sans email supprimées par défaut).
+
+Usage:
+    python contact_scraper.py --urls-file urls.txt --verbose
+    # ou éditez START_URLS dans ce fichier.
+
+Colonnes CSV:
+    domain, email, source_url, page_type, phone, contact_form_url, context_snippet, page_title
+
+Notes (pourquoi ces choix):
+- Ciblage strict pour éviter le bruit (pages produits, blog, etc.).
+- On ne supprime pas tous les espaces avant regex pour éviter des emails collés à des mots.
+- On loggue les formulaires trouvés mais on ne les écrit pas si --include-forms n'est pas fourni.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import random
+import re
+import string
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from html import unescape
+from pathlib import Path
+from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse, urldefrag
+
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib import robotparser
+
+
+# ----------------------- Entrée par défaut ----------------------- #
+
+START_URLS = [
+"http://www.makemylemonade.com/",
+"http://www.the-broken-arm.com/",
+"http://www.elevastor.com/",
+"https://merci-merci.com/collections/toutes-les-nouveautes/?utm_source=GMB&utm_medium=organic",
+"http://www.klindoeil.com/",
+"https://thefrankieshop.com/",
+"https://elevationstore.fr/",
+"https://mademoiselle-trendy.com/",
+"https://beyond-paris.ecwid.com/",
+"http://www.latelierdepablo.com/",
+"http://www.claire-naa.com/",
+"https://therollingshop.com/",
+"https://www.la-mode-vintage.com/",
+"https://lacapsuline.fr/",
+"http://www.isakinparis.com/",
+"http://www.mukasa.fr/",
+"https://shop.bienbienhabilles.fr/fr/",
+"http://www.citizenconceptstore.com/",
+"http://www.monayola.fr/",
+"http://www.serendipityparis.com/",
+"https://www.youandmeparis.com/",
+"http://www.maisonlinepo.com/",
+"http://www.monideco.com/",
+"http://www.pollenparis.fr/",
+"https://dongxi.fr/",
+"https://www.minime-paris.com/",
+"https://www.faubourg54.com/?utm_source=Google%20My%20Business&utm_medium=Boutique",
+"https://kiliwatch.paris/",
+"http://www.mamamushi.com/",
+"https://shiralaura.fr/",
+"http://www.frenchtrotters.fr/",
+"https://www.matieresareflexion.com/",
+"https://www.comptoir-latino.com/",
+"https://www.tevoa.fr/",
+"http://www.urbanvintageparis.com/",
+"http://www.episode.eu/",
+"https://www.kilo-shop.com/shop/le-marais/?utm_source=google&utm_medium=local&utm_campaign=Multidiffusion&utm_content=330&origin=GMB",
+"https://www.facebook.com/BY-FLOWERS-199702203431237/",
+"https://freepstar.fr/",
+"https://www.kilo-shop.com/shop/republique/?utm_source=google&utm_medium=local&utm_campaign=Multidiffusion&utm_content=000500&origin=GMB",
+"https://www.guerrisol.fr/",
+"http://hippy-market.fr/",
+"http://www.bisboutiquesolidaire.fr/",
+"https://www.retroparis2.com/",
+"https://freepstar.fr/",
+"https://www.kilo-shop.com/shop/grands-boulevards/?utm_source=google&utm_medium=local&utm_campaign=Multidiffusion&utm_content=000320&origin=GMB",
+"http://www.alatone.fr/",
+]
+
+URLS_TXT = Path("urls.txt")
+
+
+# ----------------------- Constantes & Regex ---------------------- #
+
+TARGET_KEYWORDS = (
+    "contact", "contactez", "faq", "aide", "help", "support", "sav",
+    "mentions", "legal", "légal", "legales", "légales",
+    "cgv", "cgu", "terms", "privacy", "confidentialite", "confidentialité", "rgpd",
+    "donnees-personnelles", "données-personnelles", "data-protection", "impressum",
+)
+
+# enfants pertinents uniquement (réduit le bruit)
+CHILD_KEYWORDS = (
+    "contact", "faq", "aide", "help", "support", "sav", "service-client", "serviceclient",
+    "team", "equipe", "équipe", "staff", "customer", "mentions", "legal", "privacy",
+    "rgpd", "conditions", "terms", "policy", "donnees", "données",
+)
+
+PAGE_TYPES = ("contact", "faq", "legal", "contact_child")
+
+BLOCKED_HOST_PARTS = (
+    "facebook.com", "instagram.com", "tiktok.com", "x.com", "twitter.com",
+    "linkedin.com", "google.", "youtube.com", "youtu.be", "pinterest.", "snapchat.com",
+)
+
+SKIP_EXTS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".rar", ".7z", ".mp3", ".mp4", ".avi", ".mov", ".wmv", ".ico",
+    ".css", ".js", ".json", ".xml", ".rss", ".atom", ".webmanifest",
+}
+
+EMAIL_REGEX = re.compile(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+PHONE_FR_REGEX = re.compile(r"(?:\+33\s?|0)(?:\s*[1-9])(?:[\s.\-]?\d{2}){4}")
+ZERO_WIDTH = "".join(["\u200b", "\u200c", "\u200d", "\ufeff"])
+
+SEED_PATHS = (
+    "/contact", "/contactez-nous", "/contact-us", "/contacts",
+    "/mentions-legales", "/mentions_légales", "/mentions", "/legal", "/legals",
+    "/faq", "/aide", "/support", "/help", "/sav",
+    "/cgv", "/cgu", "/terms", "/privacy", "/politique-de-confidentialite",
+    "/donnees-personnelles", "/donnees", "/rgpd",
+)
+
+
+# --------------------------- Modèles ----------------------------- #
+
+@dataclass(frozen=True)
+class Row:
+    domain: str
+    email: str
+    source_url: str
+    page_type: str
+    phone: str
+    contact_form_url: str
+    context_snippet: str
+    page_title: str
+
+
+# --------------------------- Utils URL --------------------------- #
+
+def strip_www(host: str) -> str:
+    return host[4:] if host.lower().startswith("www.") else host
+
+def same_domain(u: str, root_host: str) -> bool:
+    return strip_www(urlparse(u).netloc) == strip_www(root_host)
+
+def is_blocked_host(u: str) -> bool:
+    host = urlparse(u).netloc.lower()
+    return any(part in host for part in BLOCKED_HOST_PARTS)
+
+def is_asset(u: str) -> bool:
+    path = urlparse(u).path.lower()
+    return any(path.endswith(ext) for ext in SKIP_EXTS)
+
+def clean_url(u: str) -> str:
+    """Normalise: https par défaut, pas de fragments, sans UTM/fbclid/gclid."""
+    if not u:
+        return u
+    u = u.strip()
+    parsed = urlparse(u if "://" in u else f"https://{u}")
+    parsed = parsed._replace(fragment="")
+    q = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+         if not (k.lower().startswith("utm_") or k.lower() in {"gclid", "fbclid", "mc_eid"})]
+    parsed = parsed._replace(query=urlencode(q))
+    path = parsed.path or "/"
+    return urlunparse(parsed._replace(path=path))
+
+
+# ----------------------- Session & Robots ------------------------ #
+
+def session_with_retries(user_agent: str, retries: int, timeout: int) -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": user_agent,
+        "Accept-Language": "fr,fr-FR;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    # pourquoi: robustesse réseau simple
+    adapter = HTTPAdapter(max_retries=retries)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.request_timeout = timeout  # type: ignore[attr-defined]
+    return s
+
+def load_robots(root: str) -> robotparser.RobotFileParser:
+    rp = robotparser.RobotFileParser()
+    try:
+        rp.set_url(urljoin(root, "/robots.txt"))
+        rp.read()
+    except Exception:
+        pass
+    return rp
+
+def robots_allowed(rp: robotparser.RobotFileParser, agent: str, u: str) -> bool:
+    try:
+        return rp.can_fetch(agent, u)
+    except Exception:
+        return True
+
+
+# ------------------- Découverte & Classification ----------------- #
+
+def classify_page_from_url(u: str) -> Optional[str]:
+    """Retourne 'contact'|'faq'|'legal' si l'URL le suggère, sinon None."""
+    p = urlparse(u).path.lower()
+    if any(k in p for k in ("contact", "contactez", "sav", "support", "service-client", "serviceclient", "customer")):
+        return "contact"
+    if any(k in p for k in ("faq", "aide", "help", "questions")):
+        return "faq"
+    if any(k in p for k in ("mentions", "legal", "légal", "cgu", "cgv", "privacy", "confidential", "rgpd", "donnees", "données")):
+        return "legal"
+    return None
+
+def link_is_child_relevant(url: str, anchor_text: str) -> bool:
+    """Filtre les enfants: n'autorise que les liens au contenu 'contact-like'."""
+    path = urlparse(url).path.lower()
+    text = (anchor_text or "").strip().lower()
+    return any(k in path for k in CHILD_KEYWORDS) or any(k in text for k in CHILD_KEYWORDS)
+
+def discover_target_links(base_url: str, soup: BeautifulSoup, host: str) -> Set[str]:
+    """Détecte sur une page les liens internes qui matchent les mots-clés cibles."""
+    out: Set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        abs_u = urljoin(base_url, href)
+        abs_u, _ = urldefrag(abs_u)
+        if is_asset(abs_u) or is_blocked_host(abs_u):
+            continue
+        if not same_domain(abs_u, host):
+            continue
+        if classify_page_from_url(abs_u) or any(k in urlparse(abs_u).path.lower() for k in TARGET_KEYWORDS):
+            out.add(clean_url(abs_u))
+    return out
+
+def seed_candidates(root: str, session: requests.Session, timeout: int) -> Set[str]:
+    """Liste initiale: chemins connus + découverte sur la page d'accueil."""
+    seeds: Set[str] = set()
+    for p in SEED_PATHS:
+        seeds.add(urljoin(root, p))
+    try:
+        resp = session.get(root, timeout=timeout)
+        if resp.ok and "text/html" in resp.headers.get("Content-Type", ""):
+            soup = BeautifulSoup(resp.text, "html.parser")
+            seeds |= discover_target_links(resp.url, soup, urlparse(root).netloc)
+    except Exception:
+        pass
+    return {clean_url(u) for u in seeds}
+
+
+# --------------------------- Extraction -------------------------- #
+
+def deobfuscate_local(text: str) -> str:
+    """Remplace at/dot obfusqués sans supprimer les espaces partout."""
+    t = text
+    replacements = [
+        (r"\s*\[\s*at\s*\]\s*", "@"),
+        (r"\s*\(\s*at\s*\)\s*", "@"),
+        (r"\bat\b", "@"),
+        (r"\s*\{\s*at\s*\}\s*", "@"),
+        (r"\s*\[\s*dot\s*\]\s*", "."),
+        (r"\s*\(\s*dot\s*\)\s*", "."),
+        (r"\bdot\b", "."),
+        (r"\s*\{\s*dot\s*\}\s*", "."),
+        (r"NOSPAM", ""),
+    ]
+    for pat, rep in replacements:
+        t = re.sub(pat, rep, t, flags=re.IGNORECASE)
+    for ch in ZERO_WIDTH:
+        t = t.replace(ch, "")
+    return unescape(t)
+
+def is_valid_email(email: str) -> bool:
+    e = email.strip().strip(string.punctuation)
+    if not EMAIL_REGEX.fullmatch(e):
+        return False
+    if any(seg in e.lower() for seg in (".png", ".jpg", ".svg", ".css", ".js", "mailto:")):
+        return False
+    return True
+
+def extract_emails_and_context(soup: BeautifulSoup) -> List[Tuple[str, str]]:
+    """Retourne [(email, snippet_contexte)] depuis mailto: + texte."""
+    found: List[Tuple[str, str]] = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.lower().startswith("mailto:"):
+            addr = href.split("mailto:", 1)[1].split("?", 1)[0]
+            addr = deobfuscate_local(addr)
+            for m in EMAIL_REGEX.findall(addr):
+                if is_valid_email(m):
+                    found.append((m, ""))
+
+    text = soup.get_text(separator=" ", strip=True)
+    text = deobfuscate_local(text)
+    for m in EMAIL_REGEX.finditer(text):
+        email = m.group(0)
+        if not is_valid_email(email):
+            continue
+        start = max(0, m.start() - 60)
+        end = min(len(text), m.end() + 60)
+        snippet = text[start:end]
+        found.append((email, snippet))
+
+    uniq: Dict[str, str] = {}
+    for e, snip in found:
+        uniq.setdefault(e.lower(), snip)
+    return [(e, uniq[e]) for e in uniq]
+
+def extract_phones(soup: BeautifulSoup) -> Set[str]:
+    text = soup.get_text(separator=" ", strip=True)
+    return set(PHONE_FR_REGEX.findall(text))
+
+def detect_contact_form(base_url: str, soup: BeautifulSoup) -> str:
+    """Retourne l'URL d'action du form si dédié (sinon vide)."""
+    form = soup.find("form")
+    if not form:
+        return ""
+    action = (form.get("action") or "").strip()
+    if not action:
+        return base_url
+    return urljoin(base_url, action)
+
+
+# ---------------------------- Crawl -------------------------------- #
+
+def fetch(session: requests.Session, url: str, timeout: int) -> Optional[requests.Response]:
+    try:
+        r = session.get(url, timeout=timeout)
+        if not r.ok:
+            return None
+        ctype = r.headers.get("Content-Type", "")
+        if "text/html" not in ctype and "application/xhtml" not in ctype:
+            return None
+        return r
+    except requests.RequestException:
+        return None
+
+def crawl_domain(root: str, args: argparse.Namespace) -> List[Row]:
+    domain = urlparse(root).netloc
+    rp = load_robots(root)
+    session = session_with_retries(args.user_agent, args.retries, args.timeout)
+    sleep_min, sleep_max = args.sleep_min, args.sleep_max
+
+    seeds = seed_candidates(root, session, args.timeout)
+    queue: Deque[Tuple[str, int, str]] = deque()
+    for u in sorted(seeds):
+        pt = classify_page_from_url(u) or "contact"
+        queue.append((u, 0, pt))
+
+    visited: Set[str] = set()
+    results: List[Row] = []
+    seen_email_key: Set[Tuple[str, str]] = set()
+    pages = 0
+    forms_found = 0
+    emails_found = 0
+
+    logging.info("Crawl: %s | seeds=%d", domain, len(queue))
+
+    while queue and pages < args.max_pages_per_site:
+        url, depth, page_type = queue.popleft()
+        if url in visited:
+            continue
+        visited.add(url)
+
+        if is_asset(url) or is_blocked_host(url) or not same_domain(url, domain):
+            continue
+        if not args.ignore_robots and not robots_allowed(rp, args.user_agent, url):
+            continue
+
+        logging.debug("GET %s [depth=%d,type=%s] queued=%d", url, depth, page_type, len(queue))
+        time.sleep(random.uniform(sleep_min, sleep_max))
+
+        resp = fetch(session, url, args.timeout)
+        if not resp:
+            continue
+
+        pages += 1
+        base = resp.url
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title = (soup.title.string.strip() if soup.title and soup.title.string else "")
+
+        emails_ctx = extract_emails_and_context(soup)
+        phones = extract_phones(soup)
+        form_url = detect_contact_form(base, soup)
+        if form_url:
+            forms_found += 1
+
+        if emails_ctx:
+            for email, snippet in emails_ctx:
+                if args.only_same_domain:
+                    try:
+                        if strip_www(email.split("@", 1)[1].lower()) != strip_www(domain.lower()):
+                            continue
+                    except Exception:
+                        continue
+                key = (domain, email.lower())
+                if key in seen_email_key:
+                    continue
+                seen_email_key.add(key)
+                results.append(
+                    Row(
+                        domain=domain,
+                        email=email,
+                        source_url=base,
+                        page_type=page_type,
+                        phone=" | ".join(sorted(phones)) if phones else "",
+                        contact_form_url=form_url,
+                        context_snippet=snippet[:200],
+                        page_title=title,
+                    )
+                )
+                emails_found += 1
+        else:
+            # on n'écrit pas ces lignes par défaut; --include-forms permettra de les écrire au moment du CSV
+            if form_url:
+                results.append(
+                    Row(
+                        domain=domain,
+                        email="",
+                        source_url=base,
+                        page_type=page_type,
+                        phone=" | ".join(sorted(phones)) if phones else "",
+                        contact_form_url=form_url,
+                        context_snippet="",
+                        page_title=title,
+                    )
+                )
+
+        # Enfants pertinents
+        if depth < args.depth_contact:
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                abs_u = clean_url(urljoin(base, href))
+                if abs_u in visited or is_asset(abs_u) or is_blocked_host(abs_u):
+                    continue
+                if not same_domain(abs_u, domain):
+                    continue
+                if classify_page_from_url(abs_u):
+                    queue.append((abs_u, depth + 1, classify_page_from_url(abs_u) or "contact_child"))
+                    continue
+                if link_is_child_relevant(abs_u, a.get_text(" ", strip=True)):
+                    queue.append((abs_u, depth + 1, "contact_child"))
+
+    logging.info("Done: %s | pages=%d emails=%d forms=%d", domain, pages, emails_found, forms_found)
+    return results
+
+
+# --------------------------- I/O CSV ------------------------------ #
+
+def write_csv(rows: Iterable[Row], outfile: Path, include_forms: bool = False) -> None:
+    """
+    Écrit le CSV. Par défaut supprime les lignes sans email; si include_forms=True,
+    garde aussi les lignes avec formulaire mais email vide.
+    """
+    kept: List[Row] = []
+    for r in rows:
+        if r.email.strip():
+            kept.append(r)
+        elif include_forms and r.contact_form_url:
+            kept.append(r)
+
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    headers = ["domain", "email", "source_url", "page_type", "phone", "contact_form_url", "context_snippet", "page_title"]
+    with outfile.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        w.writeheader()
+        for r in kept:
+            w.writerow({
+                "domain": r.domain,
+                "email": r.email,
+                "source_url": r.source_url,
+                "page_type": r.page_type,
+                "phone": r.phone,
+                "contact_form_url": r.contact_form_url,
+                "context_snippet": r.context_snippet,
+                "page_title": r.page_title,
+            })
+    logging.info("CSV: %d lignes (filtrées) écrites dans %s (include_forms=%s)", len(kept), outfile, include_forms)
+
+
+# ---------------------------- CLI -------------------------------- #
+
+def read_urls(start_urls: List[str], file_path: Optional[Path]) -> List[str]:
+    urls: List[str] = []
+    if start_urls:
+        urls.extend(start_urls)
+    if file_path and file_path.exists():
+        for ln in file_path.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            urls.append(ln)
+    if not urls:
+        raise SystemExit("Aucune URL fournie. Ajoutez-en à START_URLS ou créez 'urls.txt'.")
+    return [clean_url(u) for u in urls]
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Scraper emails sur pages Contact/FAQ/Legal (+ enfants pertinents).")
+    p.add_argument("--urls-file", type=Path, default=URLS_TXT, help="Fichier d'URLs (1 par ligne).")
+    p.add_argument("--output", type=Path, default=Path("contacts.csv"), help="CSV de sortie.")
+    p.add_argument("--max-pages-per-site", type=int, default=40, help="Limite de pages par domaine.")
+    p.add_argument("--depth-contact", type=int, default=2, help="Profondeur de crawl depuis les pages cibles.")
+    p.add_argument("--sleep-min", type=float, default=0.5, help="Pause min (politesse).")
+    p.add_argument("--sleep-max", type=float, default=1.5, help="Pause max (politesse).")
+    p.add_argument("--timeout", type=int, default=15, help="Timeout requêtes HTTP.")
+    p.add_argument("--retries", type=int, default=2, help="Retries connexions.")
+    p.add_argument("--workers", type=int, default=3, help="Domaine(s) en parallèle.")
+    p.add_argument("--only-same-domain", action="store_true", help="Ne garder que les emails du même domaine.")
+    p.add_argument("--ignore-robots", action="store_true", help="Ignorer robots.txt (déconseillé).")
+    p.add_argument("--user-agent", default="Mozilla/5.0 (compatible; ContactOnlyScraper/1.0)", help="User-Agent HTTP.")
+    p.add_argument("--verbose", action="store_true", help="Logs DEBUG.")
+    p.add_argument("--include-forms", action="store_true", help="Inclure les lignes sans email mais avec formulaire.")
+    return p
+
+def setup_logger(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    setup_logger(args.verbose)
+    roots = read_urls(START_URLS, args.urls_file)
+    logging.info("Total domaines: %d", len(roots))
+
+    all_rows: List[Row] = []
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        futs = {ex.submit(crawl_domain, root, args): root for root in roots}
+        for fut in as_completed(futs):
+            domain = urlparse(futs[fut]).netloc
+            try:
+                rows = fut.result()
+                all_rows.extend(rows)
+            except Exception as e:
+                logging.warning("Erreur domaine %s: %s", domain, e)
+
+    write_csv(all_rows, args.output, include_forms=args.include_forms)
+    logging.info("Terminé. Fichier: %s", args.output)
+
+if __name__ == "__main__":
+    main()
