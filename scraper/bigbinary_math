@@ -1,0 +1,27 @@
+//
+// Created by Poupi on 10/11/2025.
+//
+
+#ifndef PROJET_C_V1_BIGBINARY_MATH_H
+#define PROJET_C_V1_BIGBINARY_MATH_H
+
+#include "bigbinary.h"
+
+bool isZero(const BigBinary *x) {
+    (void)x; // évite les warnings tant que tu n'as pas codé
+    return false; // valeur provisoire
+}
+
+int compareAbs(const BigBinary *a, const BigBinary *b) {
+    (void)a;
+    (void)b;
+    return 0; // valeur provisoire
+}
+
+void subAbs(BigBinary *a, const BigBinary *b) {
+    (void)a;
+    (void)b;
+    // TODO: implémenter ta soustraction en valeur absolue
+}
+
+#endif //PROJET_C_V1_BIGBINARY_MATH_H
